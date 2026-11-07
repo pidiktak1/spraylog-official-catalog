@@ -1,0 +1,3 @@
+catalog-build/
+__pycache__/
+*.pyc
