@@ -1,0 +1,89 @@
+name: Update official pesticide catalogue
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "25 3 * * *"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/update-catalog.yml"
+      - "tools/**"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: official-pesticide-catalogue
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install catalogue tools
+        run: |
+          python -m pip install --disable-pip-version-check access-parser playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Download official ΥΠΑΑΤ database
+        run: python tools/download_official_database.py
+
+      - name: Generate catalogue
+        run: |
+          mkdir -p catalog
+          OLD_ARGS=()
+          if [ -s catalog/official-pesticides.js ]; then
+            cp catalog/official-pesticides.js /tmp/previous-official-pesticides.js
+            OLD_ARGS=(--old /tmp/previous-official-pesticides.js)
+          fi
+          python tools/generate_official_catalog.py catalog-build/official.mdb catalog/official-pesticides.js "${OLD_ARGS[@]}"
+          node tools/fix_official_encoding.mjs catalog/official-pesticides.js
+          gzip -9 -c catalog/official-pesticides.js > catalog/official-pesticides.js.gz
+
+      - name: Validate and create manifest
+        run: |
+          node - <<'NODE'
+          const fs = require('fs'), vm = require('vm');
+          const context = { window: {} };
+          vm.createContext(context);
+          vm.runInContext(fs.readFileSync('catalog/official-pesticides.js', 'utf8'), context);
+          const catalogue = context.window.SPRAYLOG_OFFICIAL;
+          const serialized = JSON.stringify(catalogue);
+          if (!catalogue || catalogue.products.length < 6000) throw new Error('Unexpected catalogue size');
+          if (/[\u0000-\u001f]/.test(serialized)) throw new Error('Catalogue contains broken control characters');
+          if (!serialized.includes('ΑΓΓΟΥΡΙ ΘΕΡΜΟΚΗΠΙΟΥ')) throw new Error('Cucumber approvals are missing or unreadable');
+          if (!serialized.includes('ΜΠΑΝΑΝΑ')) throw new Error('Banana approvals are missing or unreadable');
+          if (!catalogue.products.some(product => /[Α-ΩΆΈΉΊΌΎΏ]/.test(product.n || ''))) {
+            throw new Error('Greek product names are unreadable');
+          }
+          const manifest = {
+            schemaVersion: 1,
+            snapshot: catalogue.snapshot,
+            products: catalogue.products.length,
+            file: 'official-pesticides.js',
+            gzip: 'official-pesticides.js.gz'
+          };
+          fs.writeFileSync('catalog/manifest.json', JSON.stringify(manifest, null, 2) + '\n');
+          console.log(manifest);
+          NODE
+
+      - name: Commit when official data changed
+        run: |
+          git config user.name "SprayLog catalogue updater"
+          git config user.email "actions@users.noreply.github.com"
+          git add catalog
+          if git diff --cached --quiet; then
+            echo "Official catalogue is already current."
+          else
+            git commit -m "Update official pesticide catalogue"
+            git push
+          fi
